@@ -15,9 +15,12 @@
 package org.eclipse.search.ui.text;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.LinkedBlockingDeque;
 
 import org.osgi.framework.FrameworkUtil;
 
@@ -226,8 +229,8 @@ public abstract class AbstractTextSearchViewPage extends Page implements ISearch
 	private PageBook fPagebook;
 	private boolean fIsBusyShown;
 	private ISearchResultViewPart fViewPart;
-	private Set<Object> fBatchedUpdates;
-	private boolean fBatchedClearAll;
+	private final LinkedBlockingDeque<Object> fBatchedUpdates = new LinkedBlockingDeque<>();
+	private volatile boolean fBatchedClearAll;
 
 	private ISearchResultListener fListener;
 	private IQueryListener fQueryListener;
@@ -299,8 +302,6 @@ public abstract class AbstractTextSearchViewPage extends Page implements ISearch
 
 		fSelectAllAction= new SelectAllAction();
 		createLayoutActions();
-		fBatchedUpdates = new HashSet<>();
-		fBatchedClearAll= false;
 
 		fListener = this::handleSearchResultChanged;
 		fFilterActions= null;
@@ -427,21 +428,30 @@ public abstract class AbstractTextSearchViewPage extends Page implements ISearch
 	}
 
 	/**
-	 * Opens an editor on the given file resource and tries to select the given offset and length.
+	 * Opens an editor on the given file resource and tries to select the given
+	 * offset and length.
 	 * <p>
-	 * If the page already has an editor open on the target object then that editor is brought to
-	 * front; otherwise, a new editor is opened. If <code>activate == true</code> the editor will be
-	 * activated.
-	 * <p>
+	 * If the page already has an editor open on the target object then that
+	 * editor is brought to front; otherwise, a new editor is opened. If
+	 * <code>activate == true</code> the editor will be activated.
+	 * </p>
 	 *
-	 * @param page the workbench page in which the editor will be opened
-	 * @param file the file to open
-	 * @param offset the offset to select in the editor
-	 * @param length the length to select in the editor
-	 * @param activate if <code>true</code> the editor will be activated
-	 * @return an open editor or <code>null</code> if an external editor was opened
-	 * @throws PartInitException if the editor could not be initialized
-	 * @see org.eclipse.ui.IWorkbenchPage#openEditor(IEditorInput, String, boolean)
+	 * @param page
+	 *            the workbench page in which the editor will be opened
+	 * @param file
+	 *            the file to open
+	 * @param offset
+	 *            the offset to select in the editor
+	 * @param length
+	 *            the length to select in the editor
+	 * @param activate
+	 *            if <code>true</code> the editor will be activated
+	 * @return an open editor or <code>null</code> if an external editor was
+	 *         opened
+	 * @throws PartInitException
+	 *             if the editor could not be initialized
+	 * @see org.eclipse.ui.IWorkbenchPage#openEditor(IEditorInput, String,
+	 *      boolean)
 	 * @since 3.6
 	 */
 	protected final IEditorPart openAndSelect(IWorkbenchPage page, IFile file, int offset, int length, boolean activate) throws PartInitException {
@@ -451,17 +461,23 @@ public abstract class AbstractTextSearchViewPage extends Page implements ISearch
 	/**
 	 * Opens an editor on the given file resource.
 	 * <p>
-	 * If the page already has an editor open on the target object then that editor is brought to
-	 * front; otherwise, a new editor is opened. If <code>activate == true</code> the editor will be
-	 * activated.
-	 * <p>
+	 * If the page already has an editor open on the target object then that
+	 * editor is brought to front; otherwise, a new editor is opened. If
+	 * <code>activate == true</code> the editor will be activated.
+	 * </p>
 	 *
-	 * @param page the workbench page in which the editor will be opened
-	 * @param file the file to open
-	 * @param activate if <code>true</code> the editor will be activated
-	 * @return an open editor or <code>null</code> if an external editor was opened
-	 * @throws PartInitException if the editor could not be initialized
-	 * @see org.eclipse.ui.IWorkbenchPage#openEditor(IEditorInput, String, boolean)
+	 * @param page
+	 *            the workbench page in which the editor will be opened
+	 * @param file
+	 *            the file to open
+	 * @param activate
+	 *            if <code>true</code> the editor will be activated
+	 * @return an open editor or <code>null</code> if an external editor was
+	 *         opened
+	 * @throws PartInitException
+	 *             if the editor could not be initialized
+	 * @see org.eclipse.ui.IWorkbenchPage#openEditor(IEditorInput, String,
+	 *      boolean)
 	 * @since 3.6
 	 */
 	protected final IEditorPart open(IWorkbenchPage page, IFile file, boolean activate) throws PartInitException {
@@ -1231,24 +1247,30 @@ public abstract class AbstractTextSearchViewPage extends Page implements ISearch
 		}
 	}
 
-	private synchronized void postUpdate(Match[] matches) {
-		evaluateChangedElements(matches, fBatchedUpdates);
-		scheduleUIUpdate();
+	private void postUpdate(Match[] matches) {
+		HashSet<Object> collect = new HashSet<>();
+		// for compatibility we do not pass the "fBatchedUpdates" directly:
+		evaluateChangedElements(matches, collect);
+		// nulls are forbidden in concurrent datastructures:
+		collect.removeIf(Objects::isNull);
+		fBatchedUpdates.addAll(collect);
+		scheduleUIUpdate(); // still synchronized
 	}
 
-	private synchronized void runBatchedUpdates() {
-		elementsChanged(fBatchedUpdates.toArray());
-		fBatchedUpdates.clear();
+	private void runBatchedUpdates() {
+		Collection<Object> drain = new ArrayList<>();
+		fBatchedUpdates.drainTo(drain);
+		elementsChanged(drain.toArray());
 		updateBusyLabel();
 	}
 
-	private synchronized void postClear() {
+	private void postClear() {
 		fBatchedClearAll= true;
 		fBatchedUpdates.clear();
-		scheduleUIUpdate();
+		scheduleUIUpdate(); // still synchronized
 	}
 
-	private synchronized boolean hasMoreUpdates() {
+	private boolean hasMoreUpdates() {
 		return fBatchedClearAll || !fBatchedUpdates.isEmpty();
 	}
 

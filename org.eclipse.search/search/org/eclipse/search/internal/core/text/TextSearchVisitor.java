@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (c) 2000, 2018 IBM Corporation and others.
+ * Copyright (c) 2000, 2022 IBM Corporation and others.
  *
  * This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License 2.0
@@ -20,11 +20,13 @@ import java.io.IOException;
 import java.nio.charset.IllegalCharsetNameException;
 import java.nio.charset.UnsupportedCharsetException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -82,8 +84,12 @@ public class TextSearchVisitor {
 
 	public static final boolean TRACING= "true".equalsIgnoreCase(Platform.getDebugOption("org.eclipse.search/perf")); //$NON-NLS-1$ //$NON-NLS-2$
 	private static final int NUMBER_OF_LOGICAL_THREADS= Runtime.getRuntime().availableProcessors();
-	private static final int FILES_PER_JOB= 50;
-	private static final int MAX_JOBS_COUNT= 100;
+
+	/**
+	 * Queue of files to be searched. IFile pointing to the same local file are
+	 * grouped together
+	 **/
+	private final Queue<List<IFile>> fileBatches;
 
 	public static class ReusableMatchAccess extends TextSearchMatchAccess {
 
@@ -149,32 +155,22 @@ public class TextSearchVisitor {
 	 * A job to find matches in a set of files.
 	 */
 	private class TextSearchJob extends Job {
-		private final IFile[] fFiles;
-		private final int fBegin;
-		private final int fEnd;
 		private final Map<IFile, IDocument> fDocumentsInEditors;
 		private FileCharSequenceProvider fileCharSequenceProvider;
-
-		private IPath previousLocationFromFile;
-		// occurences need to be passed to FileSearchResultCollector with growing offset
-		private List<TextSearchMatchAccess> occurencesForPreviousLocation;
-		private CharSequence charsequenceForPreviousLocation;
-
+		private final int jobCount;
 
 		/**
-		 * Searches for matches in a set of files.
+		 * Searches for matches in the files.
 		 *
-		 * @param files an array of IFiles, a portion of which is to be processed
-		 * @param begin the first element in the file array to process
-		 * @param end one past the last element in the array to process
-		 * @param documentsInEditors a map from IFile to IDocument for all open, dirty editors
+		 * @param documentsInEditors
+		 *            a map from IFile to IDocument for all open, dirty editors
+		 * @param jobCount
+		 *            number of Jobs
 		 */
-		public TextSearchJob(IFile[] files, int begin, int end, Map<IFile, IDocument> documentsInEditors) {
-			super(files[begin].getName());
+		public TextSearchJob(Map<IFile, IDocument> documentsInEditors, int jobCount) {
+			super("File Search Worker"); //$NON-NLS-1$
+			this.jobCount = jobCount;
 			setSystem(true);
-			fFiles= files;
-			fBegin= begin;
-			fEnd= end;
 			fDocumentsInEditors= documentsInEditors;
 		}
 
@@ -182,75 +178,74 @@ public class TextSearchVisitor {
 		protected IStatus run(IProgressMonitor inner) {
 			MultiStatus multiStatus=
 					new MultiStatus(NewSearchUI.PLUGIN_ID, IStatus.OK, SearchMessages.TextSearchEngine_statusMessage, null);
-			SubMonitor subMonitor= SubMonitor.convert(inner, fEnd - fBegin);
+			SubMonitor subMonitor = SubMonitor.convert(inner, fileBatches.size() / jobCount); // approximate
 			this.fileCharSequenceProvider= new FileCharSequenceProvider();
-			for (int i= fBegin; i < fEnd && !fFatalError; i++) {
-				IStatus status= processFile(fFiles[i], subMonitor.split(1));
+			List<IFile> sameFiles;
+			while (((sameFiles = fileBatches.poll()) != null) && !fFatalError && !fProgressMonitor.isCanceled()) {
+				IStatus status = processFile(sameFiles, subMonitor.split(1));
 				// Only accumulate interesting status
 				if (!status.isOK())
 					multiStatus.add(status);
 				// Group cancellation is propagated to this job's monitor.
 				// Stop processing and return the status for the completed jobs.
 			}
-			if (charsequenceForPreviousLocation != null) {
-				try {
-					fileCharSequenceProvider.releaseCharSequence(charsequenceForPreviousLocation);
-				} catch (IOException e) {
-					SearchPlugin.log(e);
-				} finally {
-					charsequenceForPreviousLocation= null;
-				}
-			}
 			fileCharSequenceProvider= null;
-			previousLocationFromFile= null;
-			occurencesForPreviousLocation= null;
+			synchronized (fLock) {
+				fLock.notify();
+			}
 			return multiStatus;
 		}
 
-		public IStatus processFile(IFile file, IProgressMonitor monitor) {
+		public IStatus processFile(List<IFile> sameFiles, IProgressMonitor monitor) {
 			// A natural cleanup after the change to use JobGroups is accepted would be to move these
 			// methods to the TextSearchJob class.
 			Matcher matcher= fSearchPattern.pattern().isEmpty() ? null : fSearchPattern.matcher(""); //$NON-NLS-1$
-
+			IFile file = sameFiles.remove(0);
+			monitor.setTaskName(file.getFullPath().toString());
 			try {
 				if (!fCollector.acceptFile(file) || matcher == null) {
 					return Status.OK_STATUS;
 				}
 
+				List<TextSearchMatchAccess> occurences;
+				CharSequence charsequence;
+
 				IDocument document= getOpenDocument(file, getDocumentsInEditors());
 				if (document != null) {
-					DocumentCharSequence documentCharSequence= new DocumentCharSequence(document);
+					charsequence = new DocumentCharSequence(document);
 					// assume all documents are non-binary
-					locateMatches(file, documentCharSequence, matcher, monitor);
-				} else if (previousLocationFromFile != null && previousLocationFromFile.equals(file.getLocation()) && !occurencesForPreviousLocation.isEmpty()) {
+					occurences = locateMatches(file, charsequence, matcher, monitor);
+				} else {
+					try {
+						charsequence = fileCharSequenceProvider.newCharSequence(file);
+						if (hasBinaryContent(charsequence, file) && !fCollector.reportBinaryFile(file)) {
+							return Status.OK_STATUS;
+						}
+						occurences = locateMatches(file, charsequence, matcher, monitor);
+					} catch (FileCharSequenceProvider.FileCharSequenceException e) {
+						throw (RuntimeException) e.getCause();
+					}
+				}
+				fCollector.flushMatches(file);
+
+				for (IFile duplicateFiles : sameFiles) {
 					// reuse previous result
 					ReusableMatchAccess matchAccess= new ReusableMatchAccess();
-					for (TextSearchMatchAccess occurence : occurencesForPreviousLocation) {
-						matchAccess.initialize(file, occurence.getMatchOffset(), occurence.getMatchLength(), charsequenceForPreviousLocation);
+					for (TextSearchMatchAccess occurence : occurences) {
+						matchAccess.initialize(duplicateFiles, occurence.getMatchOffset(), occurence.getMatchLength(),
+								charsequence);
 						boolean goOn= fCollector.acceptPatternMatch(matchAccess);
 						if (!goOn) {
 							break;
 						}
 					}
-				} else {
-					if (charsequenceForPreviousLocation != null) {
-						try {
-							fileCharSequenceProvider.releaseCharSequence(charsequenceForPreviousLocation);
-							charsequenceForPreviousLocation= null;
-						} catch (IOException e) {
-							SearchPlugin.log(e);
-						}
-					}
+					fCollector.flushMatches(duplicateFiles);
+				}
+				if (document == null) {
 					try {
-						charsequenceForPreviousLocation= fileCharSequenceProvider.newCharSequence(file);
-						if (hasBinaryContent(charsequenceForPreviousLocation, file) && !fCollector.reportBinaryFile(file)) {
-							occurencesForPreviousLocation= Collections.emptyList();
-							return Status.OK_STATUS;
-						}
-						occurencesForPreviousLocation= locateMatches(file, charsequenceForPreviousLocation, matcher, monitor);
-						previousLocationFromFile= file.getLocation();
-					} catch (FileCharSequenceProvider.FileCharSequenceException e) {
-						e.throwWrappedException();
+						fileCharSequenceProvider.releaseCharSequence(charsequence);
+					} catch (IOException e) {
+						SearchPlugin.log(e);
 					}
 				}
 			} catch (UnsupportedCharsetException e) {
@@ -282,6 +277,10 @@ public class TextSearchVisitor {
 					fNumberOfScannedFiles++;
 				}
 			}
+			if (monitor.isCanceled()) {
+				fFatalError = true;
+				return Status.CANCEL_STATUS;
+			}
 			return Status.OK_STATUS;
 		}
 
@@ -295,17 +294,16 @@ public class TextSearchVisitor {
 	private final TextSearchRequestor fCollector;
 	private final Pattern fSearchPattern;
 
-	private IProgressMonitor fProgressMonitor;
+	private volatile IProgressMonitor fProgressMonitor;
 
-	private int fNumberOfFilesToScan;
 	private int fNumberOfScannedFiles;  // Protected by fLock
 	private IFile fCurrentFile;  // Protected by fLock
-	private Object fLock= new Object();
+	private final Object fLock = new Object();
 
 	private final MultiStatus fStatus;
 	private volatile boolean fFatalError; // If true, terminates the search.
 
-	private boolean fIsLightweightAutoRefresh;
+	private volatile boolean fIsLightweightAutoRefresh;
 
 	public TextSearchVisitor(TextSearchRequestor collector, Pattern searchPattern) {
 		fCollector= collector;
@@ -314,117 +312,109 @@ public class TextSearchVisitor {
 		fSearchPattern= searchPattern;
 
 		fIsLightweightAutoRefresh= Platform.getPreferencesService().getBoolean(ResourcesPlugin.PI_RESOURCES, ResourcesPlugin.PREF_LIGHTWEIGHT_AUTO_REFRESH, false, null);
+		fileBatches = new ConcurrentLinkedQueue<>();
 	}
 
 	public IStatus search(IFile[] files, IProgressMonitor monitor) {
 		if (files.length == 0) {
 			return fStatus;
 		}
-		fProgressMonitor= monitor == null ? new NullProgressMonitor() : monitor;
-		fNumberOfScannedFiles= 0;
-		fNumberOfFilesToScan= files.length;
-		fCurrentFile= null;
-		int maxThreads= fCollector.canRunInParallel() ? NUMBER_OF_LOGICAL_THREADS : 1;
-		int jobCount= 1;
-		if (maxThreads > 1) {
-			jobCount= (files.length + FILES_PER_JOB - 1) / FILES_PER_JOB;
+		fProgressMonitor = monitor == null ? new NullProgressMonitor() : monitor;
+		synchronized (fLock) {
+			fNumberOfScannedFiles = 0;
+			fCurrentFile = null;
 		}
-		// Too many job references can cause OOM, see bug 514961
-		if (jobCount > MAX_JOBS_COUNT) {
-			jobCount= MAX_JOBS_COUNT;
-		}
-
-		// Seed count over 1 can cause endless waits, see bug 543629 comment 2
-		// TODO use seed = jobCount after the bug 543660 in JobGroup is fixed
-		final int seed = 1;
-		final JobGroup jobGroup = new TextSearchJobGroup("Text Search", maxThreads, seed); //$NON-NLS-1$
+		int threadsNeeded = Math.min(files.length, NUMBER_OF_LOGICAL_THREADS);
+		// All but 1 threads should search. 1 thread does the UI updates:
+		int jobCount = fCollector.canRunInParallel() && threadsNeeded > 1 ? threadsNeeded - 1 : 1;
 		long startTime= TRACING ? System.currentTimeMillis() : 0;
-
-		Job monitorUpdateJob= new Job(SearchMessages.TextSearchVisitor_progress_updating_job) {
-			private int fLastNumberOfScannedFiles= 0;
-
-			@Override
-			public IStatus run(IProgressMonitor inner) {
-				while (!inner.isCanceled()) {
-					// Propagate user cancellation to the JobGroup.
-					if (fProgressMonitor.isCanceled()) {
-						jobGroup.cancel();
-						break;
-					}
-
-					IFile file;
-					int numberOfScannedFiles;
-					synchronized (fLock) {
-						file= fCurrentFile;
-						numberOfScannedFiles= fNumberOfScannedFiles;
-					}
-					if (file != null) {
-						String fileName= file.getName();
-						Object[] args= { fileName, Integer.valueOf(numberOfScannedFiles), Integer.valueOf(fNumberOfFilesToScan)};
-						fProgressMonitor.subTask(Messages.format(SearchMessages.TextSearchVisitor_scanning, args));
-						int steps= numberOfScannedFiles - fLastNumberOfScannedFiles;
-						fProgressMonitor.worked(steps);
-						fLastNumberOfScannedFiles += steps;
-					}
-					try {
-						Thread.sleep(100);
-					} catch (InterruptedException e) {
-						return Status.OK_STATUS;
-					}
-				}
-				return Status.OK_STATUS;
-			}
-		};
 
 		try {
 			String taskName= fSearchPattern.pattern().isEmpty()
 					? SearchMessages.TextSearchVisitor_filesearch_task_label
-					: Messages.format(SearchMessages.TextSearchVisitor_textsearch_task_label, fSearchPattern.pattern());
-			fProgressMonitor.beginTask(taskName, fNumberOfFilesToScan);
-			monitorUpdateJob.setSystem(true);
-			monitorUpdateJob.schedule();
+					: ""; //$NON-NLS-1$
 			try {
 				fCollector.beginReporting();
+				if (fProgressMonitor.isCanceled()) {
+					throw new OperationCanceledException(SearchMessages.TextSearchVisitor_canceled);
+				}
+
 				Map<IFile, IDocument> documentsInEditors= PlatformUI.isWorkbenchRunning() ? evalNonFileBufferDocuments() : Collections.emptyMap();
-				int filesPerJob = Math.max(1, files.length / jobCount);
-				IFile[] filesByLocation= new IFile[files.length];
-				System.arraycopy(files, 0, filesByLocation, 0, files.length);
-				// Sorting files to search by location allows to more easily reuse
-				// search results from one file to the other when they have same location
-				Arrays.sort(filesByLocation, (o1, o2) -> {
-					if (o1 == o2) {
-						return 0;
-					}
-					if (o1.getLocation() == o2.getLocation()) {
-						return 0;
-					}
-					if (o1.getLocation() == null) {
-						return +1;
-					}
-					if (o2.getLocation() == null) {
-						return -1;
-					}
-					return o1.getLocation().toString().compareTo(o2.getLocation().toString());
-				});
-				for (int first= 0; first < filesByLocation.length; first += filesPerJob) {
-					int end= Math.min(filesByLocation.length, first + filesPerJob);
-					Job job= new TextSearchJob(filesByLocation, first, end, documentsInEditors);
+
+				// group files with same content together:
+				Map<String, List<IFile>> localFilesByLocation = new LinkedHashMap<>();
+				Map<String, List<IFile>> remoteFilesByLocation = new LinkedHashMap<>();
+
+				for (IFile file : files) {
+					IPath path = file.getLocation();
+					String key = path == null ? file.getLocationURI().toString() : path.toString();
+					Map<String, List<IFile>> filesByLocation = (path != null) ? localFilesByLocation
+							: remoteFilesByLocation;
+					filesByLocation.computeIfAbsent(key, k -> new ArrayList<>()).add(file);
+
+				}
+				localFilesByLocation.values().forEach(fileBatches::offer);
+				remoteFilesByLocation.values().forEach(fileBatches::offer);
+				int numberOfFilesToScan = fileBatches.size();
+				fProgressMonitor.beginTask(taskName, numberOfFilesToScan);
+
+				// Seed count over 1 can cause endless waits, see bug 543629
+				// comment 2
+				// TODO use seed = jobCount after the bug 543660 in JobGroup is
+				// fixed
+
+				final int seed = 1;
+				final JobGroup jobGroup = new TextSearchJobGroup("Text Search", jobCount, seed); //$NON-NLS-1$
+				for (int i = 0; i < jobCount; i++) {
+					Job job = new TextSearchJob(documentsInEditors, jobCount);
 					job.setJobGroup(jobGroup);
 					job.schedule();
 				}
-
-				// The monitorUpdateJob is managing progress and cancellation,
-				// so it is ok to pass a null monitor into the job group.
+				// update progress until finished or canceled:
+				int numberOfScannedFiles = 0;
+				int lastNumberOfScannedFiles = 0;
+				while (!fProgressMonitor.isCanceled() && !jobGroup.getActiveJobs().isEmpty()
+						&& numberOfScannedFiles != numberOfFilesToScan) {
+					IFile file;
+					synchronized (fLock) {
+						try {
+							// time only relevant on how often progress is
+							// updated, but cancel is notified immediately:
+							fLock.wait(100);
+						} catch (InterruptedException e) {
+							fProgressMonitor.setCanceled(true);
+							break;
+						}
+						file = fCurrentFile;
+						numberOfScannedFiles = fNumberOfScannedFiles;
+					}
+					if (file != null) {
+						String fileName = file.getName();
+						Object[] args = { fileName, Integer.valueOf(numberOfScannedFiles),
+								Integer.valueOf(numberOfFilesToScan) };
+						fProgressMonitor.subTask(Messages.format(SearchMessages.TextSearchVisitor_scanning, args));
+						int steps = numberOfScannedFiles - lastNumberOfScannedFiles;
+						fProgressMonitor.worked(steps);
+						lastNumberOfScannedFiles += steps;
+					}
+				}
+				if (fProgressMonitor.isCanceled()) {
+					jobGroup.cancel();
+				}
+				// no need to pass progressMonitor (which would show wrong
+				// progress) but null because jobGroup was already finished /
+				// canceled anyway:
 				jobGroup.join(0, null);
-				if (fProgressMonitor.isCanceled())
+				if (fProgressMonitor.isCanceled()) {
 					throw new OperationCanceledException(SearchMessages.TextSearchVisitor_canceled);
+				}
 
 				fStatus.addAll(jobGroup.getResult());
 				return fStatus;
 			} catch (InterruptedException e) {
 				throw new OperationCanceledException(SearchMessages.TextSearchVisitor_canceled);
 			} finally {
-				monitorUpdateJob.cancel();
+				fileBatches.clear();
 			}
 		} finally {
 			fProgressMonitor.done();
@@ -488,6 +478,12 @@ public class TextSearchVisitor {
 	}
 
 	private boolean hasBinaryContent(CharSequence seq, IFile file) throws CoreException {
+		if (seq instanceof String) {
+			if (!((String) seq).contains("\0")) { //$NON-NLS-1$
+				// fail fast to avoid file.getContentDescription():
+				return false;
+			}
+		}
 		IContentDescription desc= file.getContentDescription();
 		if (desc != null) {
 			IContentType contentType= desc.getContentType();
@@ -506,6 +502,7 @@ public class TextSearchVisitor {
 				}
 			}
 		} catch (IndexOutOfBoundsException e) {
+			// ignored
 		} catch (FileCharSequenceException ex) {
 			if (ex.getCause() instanceof CharConversionException)
 				return true;
@@ -534,7 +531,7 @@ public class TextSearchVisitor {
 				}
 			}
 			// Periodically check for cancellation and quit working on the current file if the job has been cancelled.
-			if (++k % 20 == 0 && monitor.isCanceled()) {
+			if (k++ % 20 == 0 && monitor.isCanceled()) {
 				break;
 			}
 		}
@@ -574,4 +571,3 @@ public class TextSearchVisitor {
 	}
 
 }
-

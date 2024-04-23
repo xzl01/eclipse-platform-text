@@ -27,9 +27,9 @@ Build-Depends:
  libequinox-preferences-java,
  libequinox-registry-java,
  libicu4j-java,
- libswt-gtk-4-java (>= 4.10),
+ libswt-gtk-4-java (>= 4.21),
  eclipse-debian-helper
-Standards-Version: 4.6.0.1
+Standards-Version: 4.6.1
 Vcs-Git: https://salsa.debian.org/java-team/eclipse-platform-text.git
 Vcs-Browser: https://salsa.debian.org/java-team/eclipse-platform-text
 Homepage: http://www.eclipse.org/eclipse/platform-text/

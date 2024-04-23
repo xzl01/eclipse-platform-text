@@ -1,3 +1,13 @@
+eclipse-platform-text (4.26-1) unstable; urgency=medium
+
+  * New upstream release
+    - Depend on libswt-gtk-4-java (>= 4.21)
+    - Build org.eclipse.jface.text with Java 11
+  * Standards-Version updated to 4.6.1
+  * Track and download the new releases from GitHub
+
+ -- Emmanuel Bourg <ebourg@apache.org>  Thu, 08 Dec 2022 19:17:54 +0100
+
 eclipse-platform-text (4.21-1) unstable; urgency=medium
 
   * New upstream release

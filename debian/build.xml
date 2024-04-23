@@ -20,7 +20,7 @@
 
   <!-- Eclipse JFace Text -->
   <target name="org.eclipse.jface.text" depends="org.eclipse.text">
-    <make-bundle name="org.eclipse.jface.text" basedir="." depends="org.eclipse.text">
+    <make-bundle name="org.eclipse.jface.text" basedir="." depends="org.eclipse.text" release="11">
       <pathelement path="/usr/share/java/eclipse-jface.jar"/>
       <pathelement path="/usr/share/java/eclipse-core-commands.jar"/>
       <pathelement path="/usr/share/java/eclipse-core-jobs.jar"/>

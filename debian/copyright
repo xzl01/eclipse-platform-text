@@ -1,6 +1,6 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: Eclipse Platform Text
-Source: https://git.eclipse.org/r/platform/eclipse.platform.text
+Source: https://github.com/eclipse-platform/eclipse.platform.text
 Files-Excluded: *.so
                 *.a
 

@@ -75,6 +75,7 @@ import org.eclipse.jface.dialogs.IDialogSettings;
 import org.eclipse.jface.preference.JFacePreferences;
 import org.eclipse.jface.util.Geometry;
 import org.eclipse.jface.util.OpenStrategy;
+import org.eclipse.jface.viewers.ISelectionChangedListener;
 
 import org.eclipse.jface.text.BadLocationException;
 import org.eclipse.jface.text.IDocument;
@@ -133,6 +134,12 @@ public class ContentAssistant implements IContentAssistant, IContentAssistantExt
 		 */
 		private Control fControl;
 
+		private Point fCaretLocation;
+
+		private int fCaretOffset;
+
+		private final ISelectionChangedListener fSelectionListener= e -> updateCurrentCaretInfo();
+
 		/**
 		 * Installs this closer on it's viewer's text widget.
 		 */
@@ -154,8 +161,19 @@ public class ContentAssistant implements IContentAssistant, IContentAssistantExt
 				 */
 				control.addDisposeListener(this);
 			}
-			if (fViewer != null)
+			if (fViewer != null) {
 				fViewer.addViewportListener(this);
+				fViewer.getSelectionProvider().addSelectionChangedListener(fSelectionListener);
+				updateCurrentCaretInfo();
+			}
+		}
+
+		private void updateCurrentCaretInfo() {
+			if (fViewer == null) {
+				return;
+			}
+			fCaretLocation= fViewer.getTextWidget().getCaret().getLocation();
+			fCaretOffset= fViewer.getSelectedRange().x;
 		}
 
 		/**
@@ -181,8 +199,10 @@ public class ContentAssistant implements IContentAssistant, IContentAssistantExt
 				control.removeDisposeListener(this);
 			}
 
-			if (fViewer != null)
+			if (fViewer != null) {
 				fViewer.removeViewportListener(this);
+				fViewer.getSelectionProvider().removeSelectionChangedListener(fSelectionListener);
+			}
 		}
 
 		@Override
@@ -241,6 +261,12 @@ public class ContentAssistant implements IContentAssistant, IContentAssistantExt
 
 		@Override
 		public void viewportChanged(int topIndex) {
+			if (fViewer != null && fCaretLocation != null && //
+					fViewer.getTextWidget().getCaret().getLocation().equals(fCaretLocation) && //
+					fViewer.getSelectedRange().x == fCaretOffset) {
+				// Most likely some codemining altered viewport but didn't modify the caret position
+				return;
+			}
 			hide();
 		}
 	}
@@ -1053,6 +1079,15 @@ public class ContentAssistant implements IContentAssistant, IContentAssistantExt
 	private boolean fCompletionProposalTriggerCharsEnabled= true;
 
 	/**
+	 * Tells whether this completion list is shown on each valid character which is either a letter
+	 * or digit. This works conjunction with {@link #fAsynchronous}
+	 *
+	 * @since 3.20
+	 */
+	private boolean fAutoActivateCompletionOnType= false;
+
+
+	/**
 	 * Creates a new content assistant. The content assistant is not automatically activated,
 	 * overlays the completion proposals with context information list if necessary, and shows the
 	 * context information above the location at which it was activated. If auto activation will be
@@ -1077,6 +1112,7 @@ public class ContentAssistant implements IContentAssistant, IContentAssistantExt
 	public ContentAssistant(boolean asynchronous) {
 		fPartitioning= IDocumentExtension3.DEFAULT_PARTITIONING;
 		fAsynchronous= asynchronous;
+		enableAutoActivateCompletionOnType(Boolean.getBoolean("org.eclipse.jface.assist.activateCompletionOnType")); //$NON-NLS-1$
 	}
 
 	/**
@@ -1202,6 +1238,11 @@ public class ContentAssistant implements IContentAssistant, IContentAssistantExt
 		if (processors == null) {
 			return TriggerType.NONE;
 		}
+
+		if (fAutoActivateCompletionOnType && (Character.isLetter(c) || Character.isDigit(c))) {
+			return TriggerType.COMPLETION_PROPOSAL;
+		}
+
 		for (IContentAssistProcessor processor : processors) {
 			IContentAssistProcessorExtension extension= IContentAssistProcessorExtension.adapt(processor);
 			if (extension.isCompletionProposalAutoActivation(c, fViewer, offset)) {
@@ -2721,4 +2762,20 @@ public class ContentAssistant implements IContentAssistant, IContentAssistantExt
 		return fIsAutoActivated;
 	}
 
+	/**
+	 * Sets whether this completion list is shown on each valid character which is either a letter
+	 * or digit. This works conjunction with {@link #fAsynchronous}
+	 *
+	 * @param enable whether or not to enable this feature
+	 * @since 3.21
+	 */
+	public final void enableAutoActivateCompletionOnType(boolean enable) {
+		if (fAsynchronous) {
+			fAutoActivateCompletionOnType= enable;
+		}
+	}
+
+	boolean isAutoActivateCompletionOnType() {
+		return fAutoActivateCompletionOnType;
+	}
 }

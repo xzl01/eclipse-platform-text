@@ -20,6 +20,7 @@ import static org.junit.Assert.assertTrue;
 
 import java.util.Arrays;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 import org.junit.After;
@@ -52,8 +53,11 @@ public class AsyncContentAssistTest {
 	private ILogListener listener;
 	private IStatus errorStatus;
 
+	private Shell shell;
+
 	@Before
 	public void setUp() {
+		shell= new Shell();
 		listener= (status, plugin) -> {
 			if(status.getSeverity() == IStatus.ERROR && "org.eclipse.jface.text".equals(status.getPlugin())) {
 				errorStatus = status;
@@ -64,12 +68,12 @@ public class AsyncContentAssistTest {
 
 	@After
 	public void tearDown() {
+		shell.dispose();
 		Platform.removeLogListener(listener);
 	}
 
 	@Test
 	public void testAsyncFailureStackOverflow() {
-		Shell shell = new Shell();
 		SourceViewer viewer = new SourceViewer(shell, null, SWT.NONE);
 		Document document = new Document("a");
 		viewer.setDocument(document);
@@ -85,7 +89,6 @@ public class AsyncContentAssistTest {
 
 	@Test
 	public void testSyncFailureNPE() {
-		Shell shell = new Shell();
 		SourceViewer viewer = new SourceViewer(shell, null, SWT.NONE);
 		Document document = new Document("a");
 		viewer.setDocument(document);
@@ -101,7 +104,6 @@ public class AsyncContentAssistTest {
 
 	@Test
 	public void testCompletePrefix() {
-		Shell shell = new Shell();
 		shell.setLayout(new FillLayout());
 		shell.setSize(500, 300);
 		SourceViewer viewer = new SourceViewer(shell, null, SWT.NONE);
@@ -113,6 +115,7 @@ public class AsyncContentAssistTest {
 		contentAssistant.enablePrefixCompletion(true);
 		contentAssistant.install(viewer);
 		shell.open();
+		DisplayHelper.driveEventQueue(shell.getDisplay());
 		Display display = shell.getDisplay();
 		final Set<Shell> beforeShells = Arrays.stream(display.getShells()).filter(Shell::isVisible).collect(Collectors.toSet());
 		contentAssistant.showPossibleCompletions();
@@ -132,7 +135,6 @@ public class AsyncContentAssistTest {
 
 	@Test
 	public void testCompleteActivationChar() {
-		Shell shell= new Shell();
 		shell.setLayout(new FillLayout());
 		shell.setSize(500, 300);
 		SourceViewer viewer= new SourceViewer(shell, null, SWT.NONE);
@@ -152,35 +154,50 @@ public class AsyncContentAssistTest {
 		final Set<Shell> beforeShells= Arrays.stream(display.getShells()).filter(Shell::isVisible).collect(Collectors.toSet());
 		Event keyEvent= new Event();
 		Control control= viewer.getTextWidget();
-		display.timerExec(200, new Runnable() {
-			@Override
-			public void run() {
-				control.forceFocus();
-				keyEvent.widget= control;
-				keyEvent.type= SWT.KeyDown;
-				keyEvent.character= 'b';
-				keyEvent.keyCode= 'b';
-				control.getDisplay().post(keyEvent);
-				keyEvent.type= SWT.KeyUp;
-				control.getDisplay().post(keyEvent);
-				DisplayHelper.driveEventQueue(control.getDisplay());
-				if (!document.get().startsWith("bb")) {
-					display.timerExec(200, this);
+		AtomicBoolean testEnded= new AtomicBoolean();
+		try {
+			display.timerExec(0, new Runnable() {
+				@Override
+				public void run() {
+					if (control.isDisposed() || testEnded.get()) {
+						// https://github.com/eclipse-platform/eclipse.platform.text/issues/75#issuecomment-1263429480
+						return; // do not fail other unit tests
+					}
+					control.getShell().forceActive();
+					if (!control.forceFocus()) {
+						display.timerExec(200, this);
+						System.out.println("no focus");
+						return;
+					}
+					keyEvent.widget= control;
+					keyEvent.type= SWT.KeyDown;
+					keyEvent.character= 'b';
+					keyEvent.keyCode= 'b';
+					control.getDisplay().post(keyEvent);
+					keyEvent.type= SWT.KeyUp;
+					control.getDisplay().post(keyEvent);
+					DisplayHelper.driveEventQueue(control.getDisplay());
+					if (!document.get().startsWith("bb")) {
+						System.out.println("character b not added to control");
+						display.timerExec(200, this);
+					}
 				}
-			}
-		});
-		assertTrue("Completion item not shown", new DisplayHelper() {
-			@Override
-			protected boolean condition() {
-				Set<Shell> newShells= Arrays.stream(display.getShells()).filter(Shell::isVisible).collect(Collectors.toSet());
-				newShells.removeAll(beforeShells);
-				if (!newShells.isEmpty()) {
-					Table completionTable= findCompletionSelectionControl(newShells.iterator().next());
-					return Arrays.stream(completionTable.getItems()).map(TableItem::getText).anyMatch(item -> item.contains(BarContentAssistProcessor.PROPOSAL.substring(document.getLength())));
+			});
+			assertTrue("Completion item not shown", new DisplayHelper() {
+				@Override
+				protected boolean condition() {
+					Set<Shell> newShells= Arrays.stream(display.getShells()).filter(Shell::isVisible).collect(Collectors.toSet());
+					newShells.removeAll(beforeShells);
+					if (!newShells.isEmpty()) {
+						Table completionTable= findCompletionSelectionControl(newShells.iterator().next());
+						return Arrays.stream(completionTable.getItems()).map(TableItem::getText).anyMatch(item -> item.contains(BarContentAssistProcessor.PROPOSAL.substring(document.getLength())));
+					}
+					return false;
 				}
-				return false;
-			}
-		}.waitForCondition(display, 4000));
+			}.waitForCondition(display, 4000));
+		} finally {
+			testEnded.set(true);
+		}
 	}
 
 	private static Table findCompletionSelectionControl(Widget control) {
